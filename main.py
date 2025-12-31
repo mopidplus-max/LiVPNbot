@@ -1,31 +1,67 @@
 import logging
 import asyncio
 import os
+import base64
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import x25519
 
-# Токен из окружения
+# Токен LiVPN
 TOKEN = os.getenv("LIVPN_TOKEN")
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# Словарь с DNS серверами
+class SetupSteps(StatesGroup):
+    choosing_dns = State()
+    choosing_endpoint = State()
+
+# Функция генерации ключей WireGuard
+def generate_wg_keys():
+    private_key = x25519.X25519PrivateKey.generate()
+    public_key = private_key.public_key()
+
+    priv_base64 = base64.b64encode(
+        private_key.private_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PrivateFormat.Raw,
+            encryption_algorithm=serialization.NoEncryption()
+        )
+    ).decode('utf-8')
+
+    pub_base64 = base64.b64encode(
+        public_key.public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw
+        )
+    ).decode('utf-8')
+
+    return priv_base64, pub_base64
+
 DNS_OPTIONS = {
     "cf": {"name": "Cloudflare", "servers": "1.1.1.1, 1.0.0.1, 2606:4700:4700::1111, 2606:4700:4700::1001"},
     "goog": {"name": "Google DNS", "servers": "8.8.8.8, 8.8.4.4, 2001:4860:4860::8888, 2001:4860:4860::8844"},
-    "q9": {"name": "Quad9", "servers": "9.9.9.9, 149.112.112.112, 2620:fe::fe, 2620:fe::9"},
-    "adg": {"name": "AdGuard DNS", "servers": "176.103.130.130, 176.103.130.131, 2a00:5a60::ad1:0ff, 2a00:5a60::ad2:0ff"},
-    "yan": {"name": "Yandex DNS", "servers": "77.88.8.8, 77.88.8.1, 77.88.8.88, 77.88.8.2"}
+    "adg": {"name": "AdGuard", "servers": "176.103.130.130, 176.103.130.131, 2a00:5a60::ad1:0ff, 2a00:5a60::ad2:0ff"},
 }
 
-def generate_livpn_config(dns_servers):
+ENDPOINT_OPTIONS = {
+    "ep1": {"name": "Стандарт (2408)", "address": "162.159.193.5:2408"},
+    "ep2": {"name": "Альтернатива (1701)", "address": "162.159.192.1:1701"},
+    "ep4": {"name": "HTTPS порт (443)", "address": "188.114.97.10:443"},
+    "ep5": {"name": "Домен (Default)", "address": "engage.cloudflareclient.com:4500"}
+}
+
+def generate_livpn_config(dns, endpoint, priv_key):
+    # Используем сгенерированный приватный ключ и твой блок I1
     return f"""[Interface]
-PrivateKey = qMvr//6Muy5NMQS4dblx3qyTbYbSEUMdLc3KJdeJOXc=
-Address = 172.16.0.2/32
-DNS = {dns_servers}
+PrivateKey = {priv_key}
+Address = 172.16.0.2/32, 2606:4700:110:8fd1:c3d9:c0fc:b3e5:956d
+DNS = {dns}
 MTU = 1280
 S1 = 0
 S2 = 0
@@ -41,51 +77,58 @@ I1 = <b 0xc10000000114367096bb0fb3f58f3a3fb8aaacd61d63a1c8a40e14f7374b8a62dccba6
 [Peer]
 PublicKey = bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=
 AllowedIPs = 0.0.0.0/0, ::/0
-Endpoint = 162.159.193.5:2408
+Endpoint = {endpoint}
 """
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    await message.answer(
-        "🚀 **LiVPN v1.5: Твой ключ к свободе!**\n\n"
-        "**Что станет доступно:**\n"
-        "🔹 YouTube (4K без тормозов)\n"
-        "🔹 Instagram & Facebook\n"
-        "🔹 ChatGPT & Claude\n"
-        "🔹 Twitter (X)\n"
-        "🔹 Любые заблокированные СМИ\n\n"
-        "Для работы используй **AmneziaVPN**.\n"
-        "Жми /getvpn, чтобы выбрать DNS и получить файл."
-    )
+    await message.answer("🦾 **LiVPN v1.5: Уникальные ключи активны!**\n\nЖми /getvpn.")
 
 @dp.message(Command("getvpn"))
-async def choose_dns(message: types.Message):
+async def start_config(message: types.Message, state: FSMContext):
     builder = InlineKeyboardBuilder()
     for code, info in DNS_OPTIONS.items():
         builder.button(text=info["name"], callback_data=f"dns_{code}")
-    builder.adjust(2) # Кнопки в два ряда
-    
-    await message.answer("🎯 **Выбери DNS-провайдера:**", reply_markup=builder.as_markup())
+    builder.adjust(2)
+    await message.answer("🎯 **Выбери DNS:**", reply_markup=builder.as_markup())
+    await state.set_state(SetupSteps.choosing_dns)
 
 @dp.callback_query(F.data.startswith("dns_"))
-async def send_vpn(callback: types.CallbackQuery):
+async def handle_dns(callback: types.CallbackQuery, state: FSMContext):
     dns_code = callback.data.split("_")[1]
-    dns_info = DNS_OPTIONS[dns_code]
+    await state.update_data(selected_dns=DNS_OPTIONS[dns_code]["servers"])
     
-    config_data = generate_livpn_config(dns_info["servers"])
-    filename = f"LiVPN_{dns_info['name']}.conf"
+    builder = InlineKeyboardBuilder()
+    for code, info in ENDPOINT_OPTIONS.items():
+        builder.button(text=info["name"], callback_data=f"ep_{code}")
+    builder.adjust(1)
     
-    config_file = types.BufferedInputFile(
-        config_data.encode('utf-8'), 
-        filename=filename
-    )
+    await callback.message.edit_text("🌐 **Выбери Эндпоинт:**", reply_markup=builder.as_markup())
+    await state.set_state(SetupSteps.choosing_endpoint)
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("ep_"))
+async def handle_endpoint(callback: types.CallbackQuery, state: FSMContext):
+    ep_code = callback.data.split("_")[1]
+    user_data = await state.get_data()
+    
+    selected_dns = user_data['selected_dns']
+    selected_ep = ENDPOINT_OPTIONS[ep_code]['address']
+    ep_name = ENDPOINT_OPTIONS[ep_code]['name']
+    
+    # Генерируем новый приватный ключ ПРЯМО ЗДЕСЬ
+    user_private_key, _ = generate_wg_keys()
+    
+    config_data = generate_livpn_config(selected_dns, selected_ep, user_private_key)
+    filename = f"LiVPN_{ep_name.split()[0]}.conf"
+    
+    config_file = types.BufferedInputFile(config_data.encode('utf-8'), filename=filename)
     
     await callback.message.answer_document(
         config_file, 
-        caption=f"✅ **Конфиг LiVPN готов!**\n"
-                f"🏷 DNS: {dns_info['name']}\n\n"
-                f"📥 Импортируй этот файл в **AmneziaVPN**."
+        caption=f"✅ **Конфиг LiVPN готов!**\n\n🔑 Твой PrivateKey сгенерирован индивидуально.\n📍 IP: `{selected_ep}`"
     )
+    await state.clear()
     await callback.answer()
 
 async def main():
