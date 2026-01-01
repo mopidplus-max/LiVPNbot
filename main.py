@@ -1,65 +1,48 @@
 import logging
 import asyncio
 import os
-import base64
+import requests
+import ijson  # Важно для работы с файлом 25МБ+
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import x25519
 
-# Токен LiVPN
+# --- НАСТРОЙКИ ---
 TOKEN = os.getenv("LIVPN_TOKEN")
+# Твоя RAW ссылка (убедись, что она постоянная)
+GITHUB_JSON_URL = "https://raw.githubusercontent.com/mopidplus-max/LiVPNbot/refs/heads/main/ip-list.json?token=GHSAT0AAAAAADQXQRLHCO3V3AA654VS6AAA2KWETEQ"
+WORKING_PRIV_KEY = "qMvr//6Muy5NMQS4dblx3qyTbYbSEUMdLc3KJdeJOXc="
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-class SetupSteps(StatesGroup):
-    choosing_dns = State()
-    choosing_endpoint = State()
+# --- ЛОГИКА ОБРАБОТКИ ТЯЖЕЛОГО JSON ---
 
-# Функция генерации ключей WireGuard
-def generate_wg_keys():
-    private_key = x25519.X25519PrivateKey.generate()
-    public_key = private_key.public_key()
+def get_allowed_ips_stream(site_key):
+    """Потоковое чтение огромного JSON по ссылке без забивания памяти"""
+    try:
+        # Открываем соединение в режиме потока (stream=True)
+        with requests.get(GITHUB_JSON_URL, stream=True, timeout=15) as r:
+            r.raise_for_status()
+            # ijson ищет ключ в потоке байтов
+            parser = ijson.kvitems(r.raw, '')
+            for key, value in parser:
+                if key == site_key:
+                    # Собираем все CIDR и IP из твоего файла
+                    ips = value.get('cidr4', []) + value.get('cidr6', [])
+                    if not ips:
+                        ips = value.get('ip4', []) + value.get('ip6', [])
+                    return ", ".join(ips) if ips else "0.0.0.0/0, ::/0"
+    except Exception as e:
+        logging.error(f"Ошибка потокового чтения: {e}")
+    return "0.0.0.0/0, ::/0"
 
-    priv_base64 = base64.b64encode(
-        private_key.private_bytes(
-            encoding=serialization.Encoding.Raw,
-            format=serialization.PrivateFormat.Raw,
-            encryption_algorithm=serialization.NoEncryption()
-        )
-    ).decode('utf-8')
-
-    pub_base64 = base64.b64encode(
-        public_key.public_bytes(
-            encoding=serialization.Encoding.Raw,
-            format=serialization.PublicFormat.Raw
-        )
-    ).decode('utf-8')
-
-    return priv_base64, pub_base64
-
-DNS_OPTIONS = {
-    "cf": {"name": "Cloudflare", "servers": "1.1.1.1, 1.0.0.1, 2606:4700:4700::1111, 2606:4700:4700::1001"},
-    "goog": {"name": "Google DNS", "servers": "8.8.8.8, 8.8.4.4, 2001:4860:4860::8888, 2001:4860:4860::8844"},
-    "adg": {"name": "AdGuard", "servers": "176.103.130.130, 176.103.130.131, 2a00:5a60::ad1:0ff, 2a00:5a60::ad2:0ff"},
-}
-
-ENDPOINT_OPTIONS = {
-    "ep1": {"name": "Стандарт (2408)", "address": "162.159.193.5:2408"},
-    "ep2": {"name": "Альтернатива (1701)", "address": "162.159.192.1:1701"},
-    "ep4": {"name": "HTTPS порт (443)", "address": "188.114.97.10:443"},
-    "ep5": {"name": "Домен (Default)", "address": "engage.cloudflareclient.com:4500"}
-}
-
-def generate_livpn_config(dns, endpoint, priv_key):
-    # Используем сгенерированный приватный ключ и твой блок I1
+def generate_config(dns, endpoint, site_key):
+    """Генерация текста конфига"""
+    allowed_ips = get_allowed_ips_stream(site_key)
     return f"""[Interface]
-PrivateKey = {priv_key}
+PrivateKey = {WORKING_PRIV_KEY}
 Address = 172.16.0.2/32, 2606:4700:110:8fd1:c3d9:c0fc:b3e5:956d
 DNS = {dns}
 MTU = 1280
@@ -76,60 +59,80 @@ I1 = <b 0xc10000000114367096bb0fb3f58f3a3fb8aaacd61d63a1c8a40e14f7374b8a62dccba6
 
 [Peer]
 PublicKey = bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=
-AllowedIPs = 0.0.0.0/0, ::/0
+AllowedIPs = {allowed_ips}
 Endpoint = {endpoint}
 """
 
+# --- ОБРАБОТЧИКИ ---
+
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    await message.answer("🦾 **LiVPN v1.5: Уникальные ключи активны!**\n\nЖми /getvpn.")
+    await message.answer(
+        "👋 **LiVPN приветствует тебя!**\n\n"
+        "• /getvpn — создать конфиг\n"
+        "• Напиши название сайта (например, `YouTube`), чтобы проверить его доступность."
+    )
 
 @dp.message(Command("getvpn"))
-async def start_config(message: types.Message, state: FSMContext):
+async def vpn_dns(message: types.Message):
     builder = InlineKeyboardBuilder()
-    for code, info in DNS_OPTIONS.items():
-        builder.button(text=info["name"], callback_data=f"dns_{code}")
+    builder.button(text="Cloudflare DNS", callback_data="dns_1.1.1.1")
+    builder.button(text="Google DNS", callback_data="dns_8.8.8.8")
     builder.adjust(2)
-    await message.answer("🎯 **Выбери DNS:**", reply_markup=builder.as_markup())
-    await state.set_state(SetupSteps.choosing_dns)
+    await message.answer("🎯 **Шаг 1: DNS**", reply_markup=builder.as_markup())
 
 @dp.callback_query(F.data.startswith("dns_"))
-async def handle_dns(callback: types.CallbackQuery, state: FSMContext):
-    dns_code = callback.data.split("_")[1]
-    await state.update_data(selected_dns=DNS_OPTIONS[dns_code]["servers"])
-    
+async def vpn_ep(callback: types.CallbackQuery):
+    dns = callback.data.split("_")[1]
     builder = InlineKeyboardBuilder()
-    for code, info in ENDPOINT_OPTIONS.items():
-        builder.button(text=info["name"], callback_data=f"ep_{code}")
+    builder.button(text="Стандарт (2408)", callback_data=f"ep_{dns}_162.159.193.5:2408")
+    builder.button(text="Warp (4500)", callback_data=f"ep_{dns}_engage.cloudflareclient.com:4500")
     builder.adjust(1)
-    
-    await callback.message.edit_text("🌐 **Выбери Эндпоинт:**", reply_markup=builder.as_markup())
-    await state.set_state(SetupSteps.choosing_endpoint)
-    await callback.answer()
+    await callback.message.edit_text("🌐 **Шаг 2: Эндпоинт**", reply_markup=builder.as_markup())
 
 @dp.callback_query(F.data.startswith("ep_"))
-async def handle_endpoint(callback: types.CallbackQuery, state: FSMContext):
-    ep_code = callback.data.split("_")[1]
-    user_data = await state.get_data()
+async def vpn_mode(callback: types.CallbackQuery):
+    _, dns, ep = callback.data.split("_")
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🚀 Весь трафик", callback_data=f"fin_{dns}_{ep}_all")
+    builder.button(text="🎬 YouTube", callback_data=f"fin_{dns}_{ep}_youtube")
+    builder.button(text="🎨 Instagram", callback_data=f"fin_{dns}_{ep}_instagram.com")
+    builder.button(text="📡 AniLibria", callback_data=f"fin_{dns}_{ep}_anilibria.tv")
+    builder.adjust(1)
+    await callback.message.edit_text("🛡 **Шаг 3: Что разблокируем?**", reply_markup=builder.as_markup())
+
+@dp.callback_query(F.data.startswith("fin_"))
+async def vpn_finish(callback: types.CallbackQuery):
+    _, dns, ep, site = callback.data.split("_")
     
-    selected_dns = user_data['selected_dns']
-    selected_ep = ENDPOINT_OPTIONS[ep_code]['address']
-    ep_name = ENDPOINT_OPTIONS[ep_code]['name']
+    await callback.message.edit_text("⏳ Генерирую конфиг... Это может занять несколько секунд из-за размера базы.")
     
-    # Генерируем новый приватный ключ ПРЯМО ЗДЕСЬ
-    user_private_key, _ = generate_wg_keys()
+    config_text = generate_config(dns, ep, site)
+    file_name = f"LiVPN_{site.split('.')[0]}.conf"
+    config_file = types.BufferedInputFile(config_text.encode('utf-8'), filename=file_name)
     
-    config_data = generate_livpn_config(selected_dns, selected_ep, user_private_key)
-    filename = f"LiVPN_{ep_name.split()[0]}.conf"
-    
-    config_file = types.BufferedInputFile(config_data.encode('utf-8'), filename=filename)
-    
-    await callback.message.answer_document(
-        config_file, 
-        caption=f"✅ **Конфиг LiVPN готов!**\n\n🔑 Твой PrivateKey сгенерирован индивидуально.\n📍 IP: `{selected_ep}`"
-    )
-    await state.clear()
+    await callback.message.answer_document(config_file, caption=f"✅ Готово!\n📍 Режим: {site}")
     await callback.answer()
+
+@dp.message()
+async def check_service(message: types.Message):
+    query = message.text.lower().strip()
+    await message.answer("🔍 Ищу в базе данных...")
+    
+    found = False
+    try:
+        with requests.get(GITHUB_JSON_URL, stream=True, timeout=10) as r:
+            parser = ijson.kvitems(r.raw, '')
+            for key, info in parser:
+                if query in key.lower() or query in info.get('name', '').lower():
+                    await message.answer(f"✅ Да! **{info.get('name', key)}** поддерживается LiVPN.")
+                    found = True
+                    break
+    except:
+        pass
+            
+    if not found:
+        await message.answer("❌ Сервис не найден, но в режиме 'Весь трафик' он будет работать.")
 
 async def main():
     await dp.start_polling(bot)
