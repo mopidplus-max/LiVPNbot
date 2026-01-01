@@ -2,15 +2,15 @@ import logging
 import asyncio
 import os
 import requests
-import ijson  # Важно для работы с файлом 25МБ+
+import ijson
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # --- НАСТРОЙКИ ---
 TOKEN = os.getenv("LIVPN_TOKEN")
-# Твоя RAW ссылка (убедись, что она постоянная)
-GITHUB_JSON_URL = "https://raw.githubusercontent.com/mopidplus-max/LiVPNbot/refs/heads/main/ip-list.json?token=GHSAT0AAAAAADQXQRLHCO3V3AA654VS6AAA2KWETEQ"
+# Твоя новая постоянная ссылка
+GITHUB_JSON_URL = "https://raw.githubusercontent.com/mopidplus-max/LiVPNbot/refs/heads/main/ip-list.json"
 WORKING_PRIV_KEY = "qMvr//6Muy5NMQS4dblx3qyTbYbSEUMdLc3KJdeJOXc="
 
 logging.basicConfig(level=logging.INFO)
@@ -20,26 +20,30 @@ dp = Dispatcher()
 # --- ЛОГИКА ОБРАБОТКИ ТЯЖЕЛОГО JSON ---
 
 def get_allowed_ips_stream(site_key):
-    """Потоковое чтение огромного JSON по ссылке без забивания памяти"""
+    """Потоковое чтение JSON: ищем только нужный сайт, не забивая память"""
+    if site_key == "all":
+        return "0.0.0.0/0, ::/0"
+        
     try:
-        # Открываем соединение в режиме потока (stream=True)
-        with requests.get(GITHUB_JSON_URL, stream=True, timeout=15) as r:
+        # stream=True позволяет скачивать файл по кусочкам
+        with requests.get(GITHUB_JSON_URL, stream=True, timeout=20) as r:
             r.raise_for_status()
-            # ijson ищет ключ в потоке байтов
+            # ijson.kvitems читает пары ключ-значение прямо из потока байтов
             parser = ijson.kvitems(r.raw, '')
             for key, value in parser:
                 if key == site_key:
-                    # Собираем все CIDR и IP из твоего файла
+                    # Извлекаем данные согласно структуре твоего файла
                     ips = value.get('cidr4', []) + value.get('cidr6', [])
                     if not ips:
                         ips = value.get('ip4', []) + value.get('ip6', [])
                     return ", ".join(ips) if ips else "0.0.0.0/0, ::/0"
     except Exception as e:
-        logging.error(f"Ошибка потокового чтения: {e}")
+        logging.error(f"Ошибка при поиске в JSON: {e}")
+    
     return "0.0.0.0/0, ::/0"
 
 def generate_config(dns, endpoint, site_key):
-    """Генерация текста конфига"""
+    """Создание текста конфига AmneziaWG"""
     allowed_ips = get_allowed_ips_stream(site_key)
     return f"""[Interface]
 PrivateKey = {WORKING_PRIV_KEY}
@@ -85,8 +89,8 @@ async def vpn_dns(message: types.Message):
 async def vpn_ep(callback: types.CallbackQuery):
     dns = callback.data.split("_")[1]
     builder = InlineKeyboardBuilder()
-    builder.button(text="Стандарт (2408)", callback_data=f"ep_{dns}_162.159.193.5:2408")
-    builder.button(text="Warp (4500)", callback_data=f"ep_{dns}_engage.cloudflareclient.com:4500")
+    builder.button(text="Порт 2408", callback_data=f"ep_{dns}_162.159.193.5:2408")
+    builder.button(text="Порт 4500", callback_data=f"ep_{dns}_engage.cloudflareclient.com:4500")
     builder.adjust(1)
     await callback.message.edit_text("🌐 **Шаг 2: Эндпоинт**", reply_markup=builder.as_markup())
 
@@ -95,17 +99,17 @@ async def vpn_mode(callback: types.CallbackQuery):
     _, dns, ep = callback.data.split("_")
     builder = InlineKeyboardBuilder()
     builder.button(text="🚀 Весь трафик", callback_data=f"fin_{dns}_{ep}_all")
-    builder.button(text="🎬 YouTube", callback_data=f"fin_{dns}_{ep}_youtube")
-    builder.button(text="🎨 Instagram", callback_data=f"fin_{dns}_{ep}_instagram.com")
-    builder.button(text="📡 AniLibria", callback_data=f"fin_{dns}_{ep}_anilibria.tv")
+    # Список популярных ключей из твоего JSON
+    popular = ["amedia.site", "anidub.pro", "anilibria.tv", "animego.org", "crunchyroll.com"]
+    for p in popular:
+        builder.button(text=f"Только {p}", callback_data=f"fin_{dns}_{ep}_{p}")
     builder.adjust(1)
-    await callback.message.edit_text("🛡 **Шаг 3: Что разблокируем?**", reply_markup=builder.as_markup())
+    await callback.message.edit_text("🛡 **Шаг 3: Режим работы**", reply_markup=builder.as_markup())
 
 @dp.callback_query(F.data.startswith("fin_"))
 async def vpn_finish(callback: types.CallbackQuery):
     _, dns, ep, site = callback.data.split("_")
-    
-    await callback.message.edit_text("⏳ Генерирую конфиг... Это может занять несколько секунд из-за размера базы.")
+    await callback.message.edit_text("⏳ Генерирую конфиг... Это займет пару секунд.")
     
     config_text = generate_config(dns, ep, site)
     file_name = f"LiVPN_{site.split('.')[0]}.conf"
@@ -117,22 +121,23 @@ async def vpn_finish(callback: types.CallbackQuery):
 @dp.message()
 async def check_service(message: types.Message):
     query = message.text.lower().strip()
-    await message.answer("🔍 Ищу в базе данных...")
+    msg = await message.answer("🔍 Проверяю базу данных...")
     
     found = False
     try:
-        with requests.get(GITHUB_JSON_URL, stream=True, timeout=10) as r:
+        with requests.get(GITHUB_JSON_URL, stream=True, timeout=15) as r:
             parser = ijson.kvitems(r.raw, '')
             for key, info in parser:
+                # Сверяем по ключу или имени
                 if query in key.lower() or query in info.get('name', '').lower():
-                    await message.answer(f"✅ Да! **{info.get('name', key)}** поддерживается LiVPN.")
+                    await msg.edit_text(f"✅ Да! Ваш сервис **{info.get('name', key)}** работает с нашим VPN.")
                     found = True
                     break
-    except:
-        pass
+    except Exception as e:
+        logging.error(f"Search error: {e}")
             
     if not found:
-        await message.answer("❌ Сервис не найден, но в режиме 'Весь трафик' он будет работать.")
+        await msg.edit_text("❌ К сожалению, этого сервиса нет в списке оптимизированных, но он будет работать в режиме 'Весь трафик'.")
 
 async def main():
     await dp.start_polling(bot)
